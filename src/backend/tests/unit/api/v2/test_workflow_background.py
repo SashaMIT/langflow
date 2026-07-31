@@ -132,6 +132,166 @@ async def test_background_status_returns_output(client, created_api_key, bg_flow
     assert body["outputs"], f"completed background status carried no outputs: {body}"
 
 
+async def test_background_status_from_job_table_with_vertex_builds_off(client, created_api_key, bg_flow):
+    """With vertex_build storage OFF, GET status must still carry the full output.
+
+    Proves the headless-executor path: disable ``vertex_builds_storage_enabled`` so
+    NO vertex_build rows are written, run a background job, then assert the GET
+    status output is sourced from the durable ``Job.result`` blob (the fallback the
+    COMPLETED branch takes when vertex-build reconstruction finds nothing).
+
+    Three proofs: (1) zero vertex_build rows keyed by job_id, (2) ``Job.result``
+    holds the captured outputs, (3) GET status returns a non-empty ``outputs`` map.
+    """
+    from uuid import UUID
+
+    from langflow.services.database.models.jobs.model import Job, JobStatus
+    from langflow.services.database.models.vertex_builds.crud import get_vertex_builds_by_job_id
+    from lfx.services.deps import get_settings_service
+
+    settings = get_settings_service().settings
+    original = settings.vertex_builds_storage_enabled
+    settings.vertex_builds_storage_enabled = False
+    try:
+        submit = await client.post("api/v2/workflows", json=_body(bg_flow), headers=_headers(created_api_key))
+        assert submit.status_code == 200, submit.text
+        job_id = submit.json()["job_id"]
+
+        row = None
+        for _ in range(200):
+            async with session_scope() as session:
+                row = await session.get(Job, UUID(job_id))
+            if row is not None and row.status in (
+                JobStatus.COMPLETED,
+                JobStatus.FAILED,
+                JobStatus.TIMED_OUT,
+            ):
+                break
+            await asyncio.sleep(0.1)
+        assert row is not None, "job row was never created"
+        assert row.status == JobStatus.COMPLETED, f"job did not complete: {row.status}"
+
+        # Proof 1: storage OFF => no vertex_build rows persisted for this job_id.
+        async with session_scope() as session:
+            vbs = await get_vertex_builds_by_job_id(session, job_id)
+        assert not vbs, f"vertex_builds were written despite storage OFF: {len(vbs)} rows"
+
+        # Proof 2: the durable Job.result blob carries the captured terminal outputs.
+        assert isinstance(row.result, dict), f"Job.result is not a dict: {row.result!r}"
+        assert row.result.get("outputs"), f"Job.result carried no outputs: {row.result}"
+
+        # Proof 3: GET status returns the full output, sourced from Job.result (reconstruct
+        # finds nothing with storage off, so the COMPLETED branch falls back to Job.result).
+        status = await client.get("api/v2/workflows", params={"job_id": job_id}, headers=_headers(created_api_key))
+        assert status.status_code == 200, status.text
+        body = status.json()
+        assert body["status"] == "completed"
+        assert body["outputs"], f"GET status carried no outputs with vertex_builds OFF: {body}"
+        # Proof 4: the Job.result path recovers the session_id from the terminal
+        # events (parity with the vertex-build path), so a background GET can
+        # continue the same chat thread even with vertex-build storage off.
+        assert body.get("session_id"), f"GET status lost session_id with vertex_builds OFF: {body}"
+    finally:
+        settings.vertex_builds_storage_enabled = original
+
+
+async def test_background_agui_populates_job_result_outputs(client, created_api_key, bg_flow):
+    """An agui-protocol background run now fills ``Job.result.outputs`` too.
+
+    Regression guard for the off-wire capture (WORKFLOW_OUTPUT_CAPTURE_EVENT): the
+    agui adapter emits no wire ``output`` event, so the runner used to leave
+    ``Job.result`` result-less and a GET status carried an empty ``outputs``. The
+    frame source now synthesizes a protocol-neutral capture frame from the raw
+    ``end_vertex``, which the runner records into ``Job.result`` without touching
+    ``job_events`` or the live bus. Proves: (1) ``Job.result`` carries outputs for
+    an agui run, (2) GET status returns a non-empty ``outputs`` map.
+    """
+    from uuid import UUID
+
+    from langflow.services.database.models.jobs.model import Job, JobStatus
+
+    body = {**_body(bg_flow), "stream_protocol": "agui"}
+    submit = await client.post("api/v2/workflows", json=body, headers=_headers(created_api_key))
+    assert submit.status_code == 200, submit.text
+    job_id = submit.json()["job_id"]
+
+    row = None
+    for _ in range(200):
+        async with session_scope() as session:
+            row = await session.get(Job, UUID(job_id))
+        if row is not None and row.status in (JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.TIMED_OUT):
+            break
+        await asyncio.sleep(0.1)
+    assert row is not None, "agui job row was never created"
+    assert row.status == JobStatus.COMPLETED, f"agui job did not complete: {row.status}"
+
+    # Proof 1: the durable Job.result blob carries the captured terminal outputs
+    # even though agui emitted no wire ``output`` event.
+    assert isinstance(row.result, dict), f"Job.result is not a dict: {row.result!r}"
+    assert row.result.get("outputs"), f"agui Job.result carried no outputs: {row.result}"
+
+    # Proof 2: GET status returns the full output, sourced from Job.result.
+    status = await client.get("api/v2/workflows", params={"job_id": job_id}, headers=_headers(created_api_key))
+    assert status.status_code == 200, status.text
+    status_body = status.json()
+    assert status_body["status"] == "completed"
+    assert status_body["outputs"], f"agui GET status carried no outputs: {status_body}"
+
+
+async def test_background_with_job_events_storage_off(client, created_api_key, bg_flow):
+    """With job-event storage OFF, the run still completes and GET carries full output.
+
+    Proves the headless toggle: disable ``job_events_storage_enabled`` so the durable
+    milestone log is NOT written, run a background job, then assert (1) the run still
+    reaches COMPLETED, (2) no streaming ``job_events`` rows were persisted, (3) the
+    completed-run ``Job.result`` still carries outputs and GET status returns them —
+    because Job.result is a separate job-table write, independent of job_events.
+    """
+    from uuid import UUID
+
+    from langflow.services.database.models.jobs.model import Job, JobEvent, JobStatus
+    from lfx.services.deps import get_settings_service
+    from sqlalchemy import func, select
+
+    settings = get_settings_service().settings
+    original = settings.job_events_storage_enabled
+    settings.job_events_storage_enabled = False
+    try:
+        submit = await client.post("api/v2/workflows", json=_body(bg_flow), headers=_headers(created_api_key))
+        assert submit.status_code == 200, submit.text
+        job_id = submit.json()["job_id"]
+
+        row = None
+        for _ in range(200):
+            async with session_scope() as session:
+                row = await session.get(Job, UUID(job_id))
+            if row is not None and row.status in (JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.TIMED_OUT):
+                break
+            await asyncio.sleep(0.1)
+        assert row is not None, "job row was never created"
+        assert row.status == JobStatus.COMPLETED, f"job did not complete: {row.status}"
+
+        # Proof 1: no streaming milestone rows were written for this job.
+        async with session_scope() as session:
+            count = await session.scalar(
+                select(func.count()).select_from(JobEvent).where(JobEvent.job_id == UUID(job_id))
+            )
+        assert count == 0, f"job_events rows were written despite storage OFF: {count}"
+
+        # Proof 2: Job.result (separate job-table write) still carries outputs.
+        assert isinstance(row.result, dict), f"Job.result is not a dict: {row.result!r}"
+        assert row.result.get("outputs"), f"Job.result empty: {row.result}"
+
+        # Proof 3: GET status returns the full output, sourced from Job.result.
+        status = await client.get("api/v2/workflows", params={"job_id": job_id}, headers=_headers(created_api_key))
+        assert status.status_code == 200, status.text
+        body = status.json()
+        assert body["status"] == "completed"
+        assert body["outputs"], f"GET status carried no outputs with job_events OFF: {body}"
+    finally:
+        settings.job_events_storage_enabled = original
+
+
 async def test_stop_does_not_overwrite_completed_job(client, created_api_key, bg_flow):
     """A late ``/stop`` on an already-COMPLETED job must NOT flip it to CANCELLED.
 

@@ -458,6 +458,10 @@ def _default_frame_source_factory(*, request, flow_id, user, adapter, **_extra):
                 # job_id) and fires the memory-base hook below with that id, so the build pipeline
                 # must not mint its own run_id-keyed WORKFLOW row + hook (it would double both).
                 track_job_status=False,
+                # Emit the off-wire terminal-output capture the runner records into
+                # ``Job.result`` — protocol-neutral, so agui-protocol runs get a
+                # populated GET-status result too (not just langflow).
+                emit_output_capture=True,
             ):
                 if terminal_error_type is not None and event_type == terminal_error_type:
                     errored = True
@@ -644,11 +648,35 @@ async def get_workflow_status(
                 folder_id=getattr(flow, "folder_id", None),
             )
 
-            # Reconstruct response from vertex_build table (sync path persists
-            # those keyed by job_id). Background runs do not write vertex_builds
-            # keyed by job_id, so reconstruction finds nothing and raises
-            # ValueError — fall back to the durable Job.result the runner wrote
-            # so a completed background run reports completed instead of 500ing.
+            # The session the run executed under, resolved exactly as the runner's
+            # frame source did (``parsed.session_id or str(flow.id)``): the submit
+            # request is persisted on ``job_metadata["request"]``, so a completed
+            # background GET echoes the same chat/memory thread sync returns. The
+            # terminal output's ``content`` is a rendered string, so it can't be
+            # searched structurally — the persisted request is the source of truth.
+            persisted_request = (job.job_metadata or {}).get("request") or {}
+            effective_session_id = persisted_request.get("session_id") or flow_id_str
+
+            # Default GET-status path: rebuild from the durable ``output`` events
+            # the runner captured into ``Job.result`` (langflow-protocol). This
+            # needs no ``vertex_build`` rows, so it works with vertex-build storage
+            # off (headless), and skips the graph reconstruction the vertex-build
+            # path does.
+            result = job.result if isinstance(job.result, dict) else {}
+            output_events = result.get("outputs") or []
+            if output_events:
+                return workflow_response_from_output_events(
+                    output_events,
+                    flow_id=flow_id_str,
+                    job_id=job_id_str,
+                    session_id=effective_session_id,
+                )
+
+            # Fallback: ``Job.result`` carried no outputs (an agui-protocol run
+            # leaves it empty; the terminal output lives only on /events) or a
+            # legacy job predates output capture. Reconstruct from the
+            # ``vertex_build`` rows keyed by job_id when they exist; if none do,
+            # ValueError degrades to a bare COMPLETED with an empty outputs map.
             try:
                 return await reconstruct_workflow_response_from_job_id(
                     session=session,
@@ -657,15 +685,11 @@ async def get_workflow_status(
                     user_id=str(current_user.id),
                 )
             except ValueError:
-                # Rebuild the result from the ``output`` events the runner
-                # captured into ``Job.result`` (langflow-protocol runs). Falls
-                # back to a bare COMPLETED when none were captured (e.g. an
-                # agui-protocol run, where the result lives only on /events).
-                result = job.result if isinstance(job.result, dict) else {}
                 return workflow_response_from_output_events(
-                    result.get("outputs") or [],
+                    [],
                     flow_id=flow_id_str,
                     job_id=job_id_str,
+                    session_id=effective_session_id,
                 )
 
         if job.status == JobStatus.FAILED:

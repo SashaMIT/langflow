@@ -487,16 +487,24 @@ def workflow_response_from_output_events(
     *,
     flow_id: str,
     job_id: str,
+    session_id: str | None = None,
 ) -> WorkflowExecutionResponse:
     """Rebuild a completed-run response from durable ``output`` event payloads.
 
-    Background runs do not persist ``vertex_builds`` keyed by ``job_id``, so the
-    vertex-build reconstruction path finds nothing. The durable runner instead
-    captures each terminal ``output`` event the langflow adapter emits (an
-    ``OutputEvent``: a ``ComponentOutput`` plus its ``component_id``) into
-    ``Job.result``. Re-keying those by component id reproduces the same
-    ``outputs`` map and resolved ``output`` that sync returns, so a completed
-    background run's GET status carries its result without a /events re-attach.
+    The durable runner captures each terminal ``output`` event the langflow
+    adapter emits (an ``OutputEvent``: a ``ComponentOutput`` plus its
+    ``component_id``) into ``Job.result``. Re-keying those by component id
+    reproduces the same ``outputs`` map and resolved ``output`` that sync
+    returns, so a completed background run's GET status carries its result
+    without a /events re-attach or any ``vertex_build`` rows — this is the
+    default GET-status path (the vertex-build reconstruction is the fallback for
+    runs that left ``Job.result`` outputs empty, e.g. agui-protocol).
+
+    ``session_id`` is the session the run executed under, supplied by the caller
+    (the terminal output's ``content`` is a rendered string here, so it can't be
+    searched structurally the way the vertex-build path can). Passing it keeps
+    the completed background GET echoing the same chat/memory thread sync does; a
+    data-only flow correctly stays None.
     """
     outputs: dict[str, ComponentOutput] = {}
     for item in output_events:
@@ -516,6 +524,7 @@ def workflow_response_from_output_events(
         flow_id=flow_id,
         job_id=job_id,
         status=JobStatus.COMPLETED,
+        session_id=session_id,
         output=_resolve_output(outputs),
         outputs=outputs,
     )

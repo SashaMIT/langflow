@@ -20,6 +20,14 @@ class TelemetrySettings(BaseModel):
     """If set to True, Langflow will track transactions between flows."""
     vertex_builds_storage_enabled: bool = True
     """If set to True, Langflow will keep track of each vertex builds (outputs) in the UI for any flow."""
+    job_events_storage_enabled: bool = True
+    """If set to True, background runs persist their durable event log to the ``job_events`` table.
+
+    This log powers the ``GET /api/v2/workflows/{job_id}/events`` reattach/replay (resume from
+    ``Last-Event-ID``). Set to False for a headless executor that never re-attaches to a run's stream:
+    the per-milestone DB writes are skipped and reattach/replay returns nothing. Live streaming while
+    connected and the completed-run ``Job.result`` (GET-status full output) are UNAFFECTED — those do
+    not depend on this table."""
 
     telemetry_writer_enabled: bool = True
     """Route transaction and vertex_build writes through an async batched writer backed by a

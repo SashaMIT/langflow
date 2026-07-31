@@ -37,6 +37,7 @@ from lfx.log.logger import logger
 from lfx.schema.schema import InputValueRequest
 from lfx.schema.workflow import JobStatus, WorkflowExecutionResponse
 from lfx.workflow.adapters import StreamAdapter, StreamEvent
+from lfx.workflow.adapters.langflow import WORKFLOW_OUTPUT_CAPTURE_EVENT, build_terminal_output_event
 from lfx.workflow.converters import ParsedWorkflowRun, create_error_response, run_response_to_workflow_response
 
 from langflow.api.utils import extract_global_variables_from_headers
@@ -185,6 +186,7 @@ async def _stream_event_frames(
     job_id: UUID | None = None,
     resume: dict | None = None,
     track_job_status: bool = True,
+    emit_output_capture: bool = False,
 ) -> AsyncIterator[tuple[bytes, str]]:
     """Run a flow via the v1 build-vertex loop, dispatch its events through ``adapter``.
 
@@ -321,6 +323,26 @@ async def _stream_event_frames(
                     seq,
                 )
                 seq += 1
+            # Off-wire terminal-output capture for ``Job.result`` (background only).
+            # Synthesized from the RAW ``end_vertex`` here — before ``adapter.translate``
+            # — so it is protocol-neutral: the ``agui`` adapter emits no wire ``output``
+            # event, so without this its background GET-status would carry no outputs.
+            # The runner captures this frame in-memory only (never persisted to
+            # ``job_events``, never published), so the wire is unchanged for every
+            # protocol and the capture is independent of durable-event storage.
+            if emit_output_capture and event_type == "end_vertex":
+                output = build_terminal_output_event(event_data)
+                if output is not None:
+                    capture_payload = {"event": "output", "data": output.model_dump(mode="json")}
+                    yield _frame(
+                        StreamEvent(
+                            type=WORKFLOW_OUTPUT_CAPTURE_EVENT,
+                            data_json=json.dumps(capture_payload, default=str),
+                        ),
+                        seq,
+                    )
+                    seq += 1
+
             for event in adapter.translate(event_type, event_data):
                 if terminal_error_type is not None and event.type == terminal_error_type:
                     terminal_error_seen = True

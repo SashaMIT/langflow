@@ -23,6 +23,7 @@ from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
 from lfx.log.logger import logger
+from lfx.workflow.adapters.langflow import WORKFLOW_OUTPUT_CAPTURE_EVENT
 
 from langflow.services.background_execution.live_bus import LiveFrame
 from langflow.services.database.models.jobs.model import JobStatus, SignalType
@@ -239,7 +240,25 @@ class JobRunner:
         # does not emit these, so agui-protocol runs leave this empty and their
         # status stays result-less (the result is still on the /events log).
         output_events: list[dict[str, Any]] = []
+        # Durable event-log storage toggle. When off, the per-milestone job_events
+        # writes are skipped (reattach/replay via GET /events is unavailable); live
+        # streaming and the completed-run Job.result are unaffected. Read once so a
+        # mid-run settings flip cannot desync the seq monotonicity within this run.
+        from lfx.services.deps import get_settings_service
+
+        persist_events = get_settings_service().settings.job_events_storage_enabled
         async for frame_bytes, event_type in self._frame_source(**source_kwargs):
+            if event_type == WORKFLOW_OUTPUT_CAPTURE_EVENT:
+                # Off-wire terminal-output capture (both protocols): record it into
+                # the in-memory result ONLY. Deliberately no ``append_event`` (never
+                # in ``job_events``) and no ``publish`` (never on the live bus), so
+                # the wire is unchanged and ``Job.result`` fills independently of
+                # durable-event storage — even if job-event writing were disabled.
+                payload = self._decode_payload(frame_bytes)
+                output_data = payload.get("data")
+                if isinstance(output_data, dict):
+                    output_events.append(output_data)
+                continue
             if event_type == HUMAN_INPUT_REQUIRED_EVENT:
                 from langflow.services.jobs.service import _unwrap_pause_payload
 
@@ -255,15 +274,22 @@ class JobRunner:
                 if await self._stop_requested(job_id):
                     raise self._user_cancelled()
                 payload = self._decode_payload(frame_bytes)
-                seq = await self._jobs.append_event(job_id, event_type, payload)
+                if persist_events:
+                    seq = await self._jobs.append_event(job_id, event_type, payload)
+                else:
+                    # Event-log storage off: keep a local monotonic seq so live
+                    # subscribers still get ordered frames; there is no durable row
+                    # to read, so reattach/replay is intentionally unavailable.
+                    seq = last_durable_seq + 1
                 last_durable_seq = seq
                 await self._bus.publish(str(job_id), LiveFrame(seq=seq, data=self._restamp_id(frame_bytes, seq)))
                 if event_type == self._adapter.terminal_error_type:
                     errored_payload = payload
-                elif event_type == "output":
-                    output_data = payload.get("data")
-                    if isinstance(output_data, dict):
-                        output_events.append(output_data)
+                # NOTE: terminal outputs are captured off-wire via the
+                # WORKFLOW_OUTPUT_CAPTURE_EVENT frame above (protocol-neutral), not
+                # from the langflow adapter's durable wire ``output`` event — that
+                # left agui-protocol ``Job.result`` empty. The wire ``output`` still
+                # flows to streaming clients via ``append_event``/``publish`` here.
             else:
                 await self._bus.publish(
                     str(job_id),

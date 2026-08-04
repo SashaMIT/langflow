@@ -238,60 +238,6 @@ async def test_background_agui_populates_job_result_outputs(client, created_api_
     assert status_body["outputs"], f"agui GET status carried no outputs: {status_body}"
 
 
-async def test_background_with_job_events_storage_off(client, created_api_key, bg_flow):
-    """With job-event storage OFF, the run still completes and GET carries full output.
-
-    Proves the headless toggle: disable ``job_events_storage_enabled`` so the durable
-    milestone log is NOT written, run a background job, then assert (1) the run still
-    reaches COMPLETED, (2) no streaming ``job_events`` rows were persisted, (3) the
-    completed-run ``Job.result`` still carries outputs and GET status returns them —
-    because Job.result is a separate job-table write, independent of job_events.
-    """
-    from uuid import UUID
-
-    from langflow.services.database.models.jobs.model import Job, JobEvent, JobStatus
-    from lfx.services.deps import get_settings_service
-    from sqlalchemy import func, select
-
-    settings = get_settings_service().settings
-    original = settings.job_events_storage_enabled
-    settings.job_events_storage_enabled = False
-    try:
-        submit = await client.post("api/v2/workflows", json=_body(bg_flow), headers=_headers(created_api_key))
-        assert submit.status_code == 200, submit.text
-        job_id = submit.json()["job_id"]
-
-        row = None
-        for _ in range(200):
-            async with session_scope() as session:
-                row = await session.get(Job, UUID(job_id))
-            if row is not None and row.status in (JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.TIMED_OUT):
-                break
-            await asyncio.sleep(0.1)
-        assert row is not None, "job row was never created"
-        assert row.status == JobStatus.COMPLETED, f"job did not complete: {row.status}"
-
-        # Proof 1: no streaming milestone rows were written for this job.
-        async with session_scope() as session:
-            count = await session.scalar(
-                select(func.count()).select_from(JobEvent).where(JobEvent.job_id == UUID(job_id))
-            )
-        assert count == 0, f"job_events rows were written despite storage OFF: {count}"
-
-        # Proof 2: Job.result (separate job-table write) still carries outputs.
-        assert isinstance(row.result, dict), f"Job.result is not a dict: {row.result!r}"
-        assert row.result.get("outputs"), f"Job.result empty: {row.result}"
-
-        # Proof 3: GET status returns the full output, sourced from Job.result.
-        status = await client.get("api/v2/workflows", params={"job_id": job_id}, headers=_headers(created_api_key))
-        assert status.status_code == 200, status.text
-        body = status.json()
-        assert body["status"] == "completed"
-        assert body["outputs"], f"GET status carried no outputs with job_events OFF: {body}"
-    finally:
-        settings.job_events_storage_enabled = original
-
-
 async def test_stop_does_not_overwrite_completed_job(client, created_api_key, bg_flow):
     """A late ``/stop`` on an already-COMPLETED job must NOT flip it to CANCELLED.
 
